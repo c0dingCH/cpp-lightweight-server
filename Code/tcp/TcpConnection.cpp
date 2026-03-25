@@ -1,0 +1,287 @@
+#include"TcpConnection.h"
+#include"Channel.h"
+#include"EventLoop.h"
+#include"Buffer.h"
+#include"Common.h"
+#include"HttpContext.h"
+#include"TimeStamp.h"
+#include"Logging.h"
+
+
+#include<functional>
+#include<unistd.h>
+#include<errno.h>
+#include<string.h>
+#include<iostream>
+#include<fcntl.h>
+#include<sys/socket.h>
+#include<sys/ioctl.h>
+#include<sys/sendfile.h>
+
+#define READ_BUFFER 1024
+
+TcpConnection::TcpConnection(EventLoop * loop, int connfd ,int connid):loop_(loop),connfd_(connfd),connid_(connid){
+  if(loop_ != nullptr){
+    channel_ = std::make_unique<Channel>(loop_,connfd_);
+    channel_ -> EnableET();  
+    channel_ -> SetReadCallback(std::bind(&TcpConnection::HandleMessage, this));
+    channel_ -> SetWriteCallback(std::bind(&TcpConnection::HandleWrite, this));
+  } 
+  read_buffer_ = std::make_unique<Buffer>();
+  send_buffer_ = std::make_unique<Buffer>();
+  state_ = State::Connected;
+
+  context_ = std::make_unique<HttpContext>();
+}
+
+TcpConnection::~TcpConnection(){
+  if(connfd_ != -1){
+    close(connfd_);
+    connfd_ = -1;
+  }
+}
+
+void TcpConnection::ConnectionEstablished(){
+  channel_->EnableRead();
+  channel_->Tie(shared_from_this());
+  if(on_connect_){
+    on_connect_(shared_from_this());
+  }
+}
+
+void TcpConnection::ConnectionDestructor(){
+  loop_->DeleteChannel(channel_.get());
+}
+
+
+void TcpConnection::HandleMessage(){
+  Read();
+  if(state_ == State::Connected && on_message_){
+    on_message_(shared_from_this());
+    
+  }
+}
+
+void TcpConnection::HandleWrite(){
+  if(channel_ -> IsWriting()){
+    if(state_ == State::Connected){
+      ssize_t n = write(connfd_, send_buffer_ -> beginread(), send_buffer_ -> readablebytes());
+      send_buffer_ -> Retrieve(n);
+
+      if(n >= 0){
+        if(send_buffer_ -> readablebytes() == 0){
+          channel_ -> DisableWrite();
+          LOG_INFO << "write once ok !";
+        }
+      }
+      else{
+        LOG_ERROR << "syswrite error";
+      }
+
+    }
+    else{
+      LOG_INFO << "give up writing for disconnection";
+    }
+  }
+
+}
+
+
+void TcpConnection::HandleClose(){
+  if(state_ != State::Closed){
+    state_ = State::Closed;
+    
+    //std::cout<<"client fd: "<<GetFd()<<" Closed "<<std::endl;
+    
+    channel_ -> DisableAll();
+    if(on_close_){ 
+      on_close_(shared_from_this());
+    }
+  }
+}       
+
+
+void TcpConnection::Write(){
+  WriteNonBlocking();
+  send_buffer_->RetrieveAll();
+}
+
+void TcpConnection::Read(){
+  read_buffer_->RetrieveAll();
+  ReadNonBlocking();
+}
+
+void TcpConnection::Send(const char * msg){
+  Send(msg,strlen(msg));
+}
+
+void TcpConnection::Send(const char * msg,int len){
+  send_buffer_->Append(msg,len);
+  Write();
+}
+
+void TcpConnection::Send(const std::string & msg){
+  Send(msg.data(), msg.size());
+}
+
+void TcpConnection::SendInLoop(const char * msg){
+  SendInLoop(msg,strlen(msg));  
+}
+
+void TcpConnection::SendInLoop(const char * msg, int len){
+  if(state_ == State::Connected){
+    ssize_t n = 0;
+    if(!channel_ -> IsWriting() && send_buffer_ -> readablebytes() == 0){
+      n = write(connfd_, msg, len);
+    }
+    if(n < 0){
+      n = 0;
+      if(errno != EAGAIN && errno != EWOULDBLOCK){
+        LOG_ERROR << "syswrite error";
+      }
+    }
+    
+    if(n < len){
+      send_buffer_ -> Append(msg + n, len - n);
+      if(!channel_ -> IsWriting()){
+        channel_ -> EnableWrite();
+      }
+    }
+  }
+  else{
+    LOG_ERROR << "give up writing for disconnection";
+  }
+}
+
+void TcpConnection::SendInLoop(const std::string & msg){
+  SendInLoop(msg.data(),msg.size());
+}
+
+
+void TcpConnection::SendFile(int filefd, int siz){ // 这里文件大了可能会造成阻塞
+  int data_size = siz;
+  int write_size = 0;
+  
+  while(write_size < data_size){ // sendfile 自动更新下次写的位置
+    ssize_t write_bytes = sendfile(connfd_, filefd, (off_t *)&write_size, data_size - write_size);
+    if(write_bytes == -1){
+      if(errno == EAGAIN || errno == EWOULDBLOCK){
+        break;
+      }
+      else{
+        LOG_ERROR << "File send error !";
+        break;
+      }
+    }
+  }
+}
+
+
+
+void TcpConnection::ReadNonBlocking(){
+  int sockfd = connfd_;
+  char buf[1024];
+  while(true){
+    memset(buf,0,sizeof buf);
+    ssize_t read_bytes = ::read(sockfd,buf,sizeof buf);
+    if(read_bytes > 0){
+      read_buffer_->Append(buf,read_bytes);
+    }
+    else if(read_bytes == 0){
+      //printf("client %d disconnected \n", sockfd);
+      HandleClose();
+      break;
+    }
+    else if(read_bytes == -1 && errno == EINTR){
+      printf("Continue reading\n");
+      continue;
+    }
+    else if(read_bytes == -1 && (errno == EAGAIN  || errno ==  EWOULDBLOCK)){
+      break;
+    }
+    else{
+      printf("Other errno on client %d read \n", sockfd);
+      HandleClose();
+      break;
+    }
+  }
+}
+
+void TcpConnection::WriteNonBlocking(){
+  int sockfd = connfd_;
+  char buf[send_buffer_->readablebytes()];
+  memcpy(buf,send_buffer_->beginread(), send_buffer_->readablebytes());
+  int data_size = send_buffer_->readablebytes();
+  int data_left = data_size;
+  while(data_left > 0){
+    ssize_t write_bytes = ::write(sockfd, buf + data_size - data_left, data_left);
+    if(write_bytes == -1){
+      if(errno == EINTR){
+        printf("continue writing\n");
+        continue;
+      }
+      else if(errno == EAGAIN || errno == EWOULDBLOCK) break;
+      else{
+        printf("Other errno on client %d write",sockfd);
+        HandleClose();
+        break;
+      }
+    }
+   data_left -= write_bytes;
+  }
+}
+
+
+TcpConnection::State TcpConnection::GetState() const{
+  return state_;
+}
+
+EventLoop * TcpConnection::GetLoop() const{
+  return loop_;
+}
+
+int TcpConnection::GetFd() const{
+  return connfd_;
+}
+
+int TcpConnection::GetId() const{
+  return connid_;
+}
+
+HttpContext * TcpConnection::GetContext(){
+  return context_.get();
+}
+
+TimeStamp TcpConnection::GetTimeStamp(){
+  return timestamp_;
+
+}
+
+
+Buffer * TcpConnection::GetReadBuffer() const{
+  return read_buffer_.get();
+}
+
+
+Buffer * TcpConnection::GetSendBuffer() const{
+  return send_buffer_.get();
+}
+
+
+
+void TcpConnection::SetOnCloseCallback(const std::function<void(const std::shared_ptr<TcpConnection>)> &cb){
+  on_close_ = std::move(cb);
+}
+
+void TcpConnection::SetOnMessageCallback(const std::function<void(const std::shared_ptr<TcpConnection>)> &cb){
+  on_message_ = std::move(cb);
+}
+
+void TcpConnection::SetOnConnectCallback(const std::function<void(const std::shared_ptr<TcpConnection>)> &cb){
+  on_connect_ = std::move(cb);
+}
+
+void TcpConnection::SetTimeStamp(TimeStamp timestamp){
+  timestamp_ = timestamp;
+}
+

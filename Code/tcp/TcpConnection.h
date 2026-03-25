@@ -1,0 +1,79 @@
+#pragma once
+#include<functional>
+#include"Common.h"
+#include"TimeStamp.h"
+#include<memory>
+
+class EventLoop;
+class Socket;
+class Channel;
+class Buffer;
+class HttpContext;
+
+class TcpConnection : public std::enable_shared_from_this<TcpConnection>{
+public:
+  enum State{
+    Invalid = 1,
+    Connected,
+    Closed
+  };
+
+  TcpConnection(EventLoop * loop, int connfd, int connid);
+  ~TcpConnection();
+  DISALLOW_COPY_AND_MOVE(TcpConnection);
+
+  void ConnectionEstablished();
+  void ConnectionDestructor();
+
+  void SetOnCloseCallback(const std::function<void(const std::shared_ptr<TcpConnection>)> &cb);
+  void SetOnMessageCallback(const std::function<void(const std::shared_ptr<TcpConnection>)> & cb);
+  void SetOnConnectCallback(const std::function<void(const std::shared_ptr<TcpConnection>)> & cb);
+  void SetTimeStamp(TimeStamp timestamp);
+
+  void Read();
+  void Write();
+  void Send(const char * msg);
+  void Send(const char * msg,int len);
+  void Send(const std::string & msg);
+  void SendInLoop(const char * msg);
+  void SendInLoop(const char * msg,int len);
+  void SendInLoop(const std::string & msg);
+  void SendFile(int filefd, int siz);  
+
+  Buffer * GetReadBuffer() const;
+  Buffer * GetSendBuffer() const;
+  
+  State GetState() const;
+  EventLoop * GetLoop() const;
+  int GetFd() const;
+  int GetId() const;
+  HttpContext * GetContext();
+  TimeStamp GetTimeStamp();
+
+  void HandleClose();
+  void HandleMessage();
+  void HandleWrite();
+
+private:
+  EventLoop * loop_{nullptr};
+  int connfd_{-1};
+  int connid_{-1};
+  State state_{State::Invalid};
+  
+
+  std::unique_ptr<Channel> channel_;
+  std::unique_ptr<Buffer> read_buffer_;
+  std::unique_ptr<Buffer> send_buffer_;
+
+  std::function<void(const std::shared_ptr<TcpConnection>)> on_close_;
+  std::function<void(const std::shared_ptr<TcpConnection>)> on_message_;
+  std::function<void(const std::shared_ptr<TcpConnection>)> on_connect_;
+
+  void ReadNonBlocking();
+  void WriteNonBlocking();
+
+  std::unique_ptr<HttpContext>context_;  
+  
+  TimeStamp timestamp_;
+
+};
