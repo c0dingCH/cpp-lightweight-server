@@ -1,0 +1,40 @@
+cmake_minimum_required(VERSION 3.10)
+project(WebServer)
+
+# 公共编译选项
+set(CMAKE_CXX_FLAGS "-g -Wall -Werror -std=c++17")
+set(CMAKE_CXX_COMPILER "g++")
+set(CMAKE_CXX_FLAGS_DEBUG "-O0")
+
+# 包含目录
+include_directories(
+    base
+    tcp
+    http
+    timer
+    log
+)
+
+find_package(Threads REQUIRED)
+
+# 自动收集所有子目录里的源文件
+file(GLOB SRC_BASE base/*.cpp)
+file(GLOB SRC_TCP tcp/*.cpp)
+file(GLOB SRC_HTTP http/*.cpp)
+file(GLOB SRC_TIMER timer/*.cpp)
+file(GLOB SRC_LOG log/*.cpp)
+set(SRC_ALL ${SRC_BASE} ${SRC_TCP} ${SRC_HTTP} ${SRC_TIMER} ${SRC_LOG})
+
+# 设置可执行文件输出路径
+set(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/build/test/)
+
+# 自动收集 test 目录下所有 cpp 文件
+file(GLOB TESTS test/*.cpp)
+
+# 遍历每个测试文件，生成对应的可执行文件
+foreach(test_file ${TESTS})
+    get_filename_component(test_name ${test_file} NAME_WE)  # 去掉路径和扩展名
+    add_executable(${test_name} ${test_file} ${SRC_ALL})
+    target_link_libraries(${test_name} ${CMAKE_THREAD_LIBS_INIT})
+endforeach()
+
